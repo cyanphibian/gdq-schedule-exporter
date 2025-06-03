@@ -40,6 +40,11 @@ def parse_args():
         action='store_true',
         help="Create a Fatales-only calendar(default: False)"
     )
+    parser.add_argument(
+        '--gcal',
+        action='store_true',
+        help='Enable creating google calendars automatically(default: False)'
+    )
     return parser.parse_args()
 
 def configure_logging(loglevel):
@@ -80,6 +85,8 @@ global GENERAL_GCAL_EVENTS
 GENERAL_GCAL_EVENTS: list[EventResource] = []
 global FATALES_GCAL_EVENTS
 FATALES_GCAL_EVENTS: list[EventResource] = []
+global ENABLE_GCAL
+ENABLE_GCAL: bool = False
 
 # functions
 def read_file_as_list(file_name):
@@ -178,7 +185,7 @@ def find_or_create_google_calendars(service: Resource, timezone: str):
 
     page_token = cal_list.get('nextPageToken')
 
-def create_cal(schedule_data: list, cal_service: Resource, fatales_names: set = set()) -> tuple[Calendar, BatchHttpRequest]:
+def create_cal(schedule_data: list, cal_service: Resource | None, fatales_names: set = set()) -> tuple[Calendar, BatchHttpRequest]:
     global GENERAL_CAL_ID
     global FATALES_CAL_ID
 
@@ -254,21 +261,18 @@ def create_cal(schedule_data: list, cal_service: Resource, fatales_names: set = 
         end_dt = end_dt.astimezone(pytz.utc)
 
         event.add('summary', summary)
-        gcal_event['summary'] = summary
-
         event.add('description', description)
-        gcal_event['description'] = description
-
         event.add('dtstart', start_dt)
-        gcal_event['start']['dateTime'] = run.startTime
-
         event.add('dtend', end_dt)
-        gcal_event['end']['dateTime'] = run.endTime
-
         event.add('dtstamp', datetime.now(pytz.utc))
-
         event.add('uid', icalUid)
-        gcal_event['id'] = eventId
+
+        if ENABLE_GCAL:
+            gcal_event['summary'] = summary
+            gcal_event['description'] = description
+            gcal_event['start']['dateTime'] = run.startTime
+            gcal_event['end']['dateTime'] = run.endTime
+            gcal_event['id'] = eventId
 
         calendar.add_component(event)
         if eventId in event_ids:
@@ -345,11 +349,14 @@ def main():
     global FATALES_CAL_NAME
     global EVENT_TIMEZONE
     global INCLUDE_FATALES_ONLY_CAL
+    global ENABLE_GCAL
     args = parse_args()
     configure_logging(args.loglevel)
     INCLUDE_FATALES_ONLY_CAL = args.fatales
     GDQ_EVENT_ID = args.id
     GDQ_EVENT_URL = f'https://gamesdonequick.com/api/schedule/{GDQ_EVENT_ID}'
+    if args.gcal:
+        ENABLE_GCAL = True
 
 
     try:
@@ -381,23 +388,27 @@ def main():
         GENERAL_CAL_NAME = f'{GDQ_EVENT_NAME} {GDQ_EVENT_YEAR} Schedule'
         FATALES_CAL_NAME = f'{GENERAL_CAL_NAME} — Fatales Runs!'
 
-        creds = google_login()
-        cal_service = build("calendar", "v3", credentials=creds)
-        find_or_create_google_calendars(cal_service, EVENT_TIMEZONE)
+        cal_service = None
+        if ENABLE_GCAL:
+            creds = google_login()
+            cal_service = build("calendar", "v3", credentials=creds)
+            find_or_create_google_calendars(cal_service, EVENT_TIMEZONE)
 
         logging.info("Starting ICS creation...")
         event_cal, event_batch = create_cal(schedule_data, cal_service=cal_service) # schedule without Fatales filter
         create_ics(event_cal)
-        logging.info("Creating general schedule with Google Calendar...")
-        event_batch.execute()
+        if ENABLE_GCAL:
+            logging.info("Creating general schedule with Google Calendar...")
+            event_batch.execute()
 
         if INCLUDE_FATALES_ONLY_CAL:
             logging.info("Starting Fatales-only ICS creation...")
             fatales_names = get_fatales_names_lowered()
             fatales_event_cal, fatales_event_batch = create_cal(schedule_data, cal_service, fatales_names)
             create_ics(fatales_event_cal, True)
-            logging.info("Creating Fatales-only schedule with Google Calendar...")
-            fatales_event_batch.execute()
+            if ENABLE_GCAL:
+                logging.info("Creating Fatales-only schedule with Google Calendar...")
+                fatales_event_batch.execute()
 
     except Exception as e:
         logging.error(f"An error occurred: {e}")
