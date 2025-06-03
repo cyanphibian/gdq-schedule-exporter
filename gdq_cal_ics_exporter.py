@@ -1,9 +1,11 @@
+from __future__ import annotations
 import argparse
 import base64
 import logging
 import os
 import pytz
 import requests
+import typing
 
 from collections import namedtuple
 from datetime import datetime
@@ -15,6 +17,9 @@ from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
+if typing.TYPE_CHECKING:
+    from googleapiclient._apis.calendar.v3 import EventResource
+
 # enable logging configuration
 def parse_args():
     parser = argparse.ArgumentParser(description="GDQ Schedule ICS Exporter")
@@ -23,6 +28,17 @@ def parse_args():
         default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         help="Set the logging level (default: INFO)"
+    )
+    parser.add_argument(
+        '--id',
+        required=True,
+        type=int,
+        help="The event ID to run for"
+    )
+    parser.add_argument(
+        '--fatales',
+        action='store_true',
+        help="Create a Fatales-only calendar(default: False)"
     )
     return parser.parse_args()
 
@@ -39,20 +55,32 @@ GOOGLE_SCOPES = [
 ]
 
 # event globals — update with each event
-GDQ_EVENT_ID = 56
-GDQ_EVENT_NAME = 'TEST_sgdq'
-INCLUDE_FATALES_ONLY_CAL = True
 FATALES_NAMES_FILE = 'fatales_names.txt' # no public list — this needs to be ~manually updated~ to include folks in the event
 
 # Templates, do not touch
-GDQ_EVENT_URL = f'https://gamesdonequick.com/api/schedule/{GDQ_EVENT_ID}'
-GENERAL_CAL_NAME = None
-GDQ_EVENT_YEAR = None
-GDQ_EVENT_NAME = None
-GENERAL_CAL_ID = None
-FATALES_CAL_ID = None
-EVENT_DATA = {}
-EVENT_TIMEZONE = None
+global GDQ_EVENT_ID
+GDQ_EVENT_ID: int
+global GENERAL_CAL_NAME
+GENERAL_CAL_NAME: str = ""
+global GDQ_EVENT_YEAR
+GDQ_EVENT_YEAR: str = ""
+global GDQ_EVENT_NAME
+GDQ_EVENT_NAME: str = ""
+global GENERAL_CAL_ID
+GENERAL_CAL_ID: str = ""
+global FATALES_CAL_ID
+FATALES_CAL_ID: str = ""
+global EVENT_DATA
+EVENT_DATA: dict = {}
+global EVENT_TIMEZONE
+EVENT_TIMEZONE: str = ""
+global INCLUDE_FATALES_ONLY_CAL
+INCLUDE_FATALES_ONLY_CAL: bool = False
+global GENERAL_GCAL_EVENTS
+GENERAL_GCAL_EVENTS: list[EventResource] = []
+global FATALES_GCAL_EVENTS
+FATALES_GCAL_EVENTS: list[EventResource] = []
+
 # functions
 def read_file_as_list(file_name):
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -89,6 +117,8 @@ def get_schedule() -> list:
 def find_or_create_google_calendars(service: Resource, timezone: str):
     global FATALES_CAL_ID
     global GENERAL_CAL_ID
+    global GENERAL_GCAL_EVENTS
+    global FATALES_GCAL_EVENTS
     page_token = None
     cal_list = service.calendarList().list(pageToken=page_token).execute()
     for entry in cal_list['items']:
@@ -117,7 +147,17 @@ def find_or_create_google_calendars(service: Resource, timezone: str):
         service.acl().insert(calendarId=new_cal['id'], body=acl).execute()
         logging.info(f"Did not find a calendar for {GDQ_EVENT_NAME} {GDQ_EVENT_YEAR}, created one!")
         GENERAL_CAL_ID = new_cal['id']
-    if not FATALES_CAL_ID:
+    else:
+        # If we have an existing calendar, fetch all events from it for updates later.
+        req = service.events().list(calendarId=GENERAL_CAL_ID)
+        res = req.execute()
+        GENERAL_GCAL_EVENTS.extend(res['items'])
+        if res.get('nextPageToken'):
+            req = service.events().list_next(previous_request=req, previous_response=res)
+            res = req.execute()
+            GENERAL_GCAL_EVENTS.extend(res['items'])
+
+    if not FATALES_CAL_ID and INCLUDE_FATALES_ONLY_CAL:
         cal = {
             'summary': FATALES_CAL_NAME,
             'timeZone': timezone
@@ -126,17 +166,31 @@ def find_or_create_google_calendars(service: Resource, timezone: str):
         service.acl().insert(calendarId=new_cal['id'], body=acl).execute()
         logging.info(f"Did not find a fatales calendar for {GDQ_EVENT_NAME} {GDQ_EVENT_YEAR}, created one!")
         FATALES_CAL_ID = new_cal['id']
+    elif FATALES_CAL_ID and INCLUDE_FATALES_ONLY_CAL:
+        req = service.events().list(calendarId=FATALES_CAL_ID)
+        res = req.execute()
+        FATALES_GCAL_EVENTS.extend(res['items'])
+        if res.get('nextPageToken'):
+            req = service.events().list_next(previous_request=req, previous_response=res)
+            res = req.execute()
+            FATALES_GCAL_EVENTS.extend(res['items'])
 
 
     page_token = cal_list.get('nextPageToken')
 
 def create_cal(schedule_data: list, cal_service: Resource, fatales_names: set = set()) -> tuple[Calendar, BatchHttpRequest]:
+    global GENERAL_CAL_ID
+    global FATALES_CAL_ID
+
     logging.debug("Starting to process events...")
     last_updated = datetime.now(pytz.timezone('US/Eastern'))
 
     # if any fatales_names are provided, then filter schedule for Fatales
     filter_for_fatales = True if fatales_names else False
     cal_id = FATALES_CAL_ID if fatales_names else GENERAL_CAL_ID
+    # Pre-existing event IDs that are already on the calendar
+    events = FATALES_GCAL_EVENTS if fatales_names else GENERAL_GCAL_EVENTS
+    event_ids = [e['id'] for e in events]
     logging.debug(f"Filtering for Fatales: {filter_for_fatales}")
 
     Speedrun = namedtuple('Speedrun', ['Game', 'hasFatale', 'Runners', 'startTime', 'endTime', 'id', 'category', 'console'])
@@ -163,7 +217,7 @@ def create_cal(schedule_data: list, cal_service: Resource, fatales_names: set = 
         logging.debug(f"Runs after Fatales filter: {all_runs}")
 
     logging.debug("Starting to create calendar object...")
-    logging.debug("Fetching ")
+    logging.debug("Fetching")
     calendar = Calendar()
     gcal_batch = cal_service.new_batch_http_request()
 
@@ -217,7 +271,16 @@ def create_cal(schedule_data: list, cal_service: Resource, fatales_names: set = 
         gcal_event['id'] = eventId
 
         calendar.add_component(event)
-        gcal_batch.add(cal_service.events().insert(calendarId=cal_id, body=gcal_event))
+        if eventId in event_ids:
+            # If pre-existing event, use `update()` instead of `insert()` to update the event.
+            # Note that we don't check if the event is the exact same content-wise, so we always update
+            # even if nothing has changed.
+            # While we could also use `patch()`, the google API documentation recommends using `get()` + `update()` instead,
+            # as `patch()` consumes 3 quota units, vs just 2 for the get+update.
+            # `patch()` would allow us to only send partial updates of changed events, though.
+            gcal_batch.add(cal_service.events().update(calendarId=cal_id, eventId=eventId, body=gcal_event))
+        else:
+            gcal_batch.add(cal_service.events().insert(calendarId=cal_id, body=gcal_event))
 
     return calendar, gcal_batch
 
@@ -264,7 +327,7 @@ def google_login():
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", GOOGLE_SCOPES)
-            creds = flow.run_local_server(port=8080)
+            creds = flow.run_local_server(port=8081, open_browser=False)
 
         with open("token.json", "w") as token:
             token.write(creds.to_json())
@@ -274,13 +337,20 @@ def google_login():
 
 def main():
     global EVENT_DATA
+    global GDQ_EVENT_ID
     global GDQ_EVENT_NAME
     global GDQ_EVENT_YEAR
+    global GDQ_EVENT_URL
     global GENERAL_CAL_NAME
     global FATALES_CAL_NAME
     global EVENT_TIMEZONE
+    global INCLUDE_FATALES_ONLY_CAL
     args = parse_args()
     configure_logging(args.loglevel)
+    INCLUDE_FATALES_ONLY_CAL = args.fatales
+    GDQ_EVENT_ID = args.id
+    GDQ_EVENT_URL = f'https://gamesdonequick.com/api/schedule/{GDQ_EVENT_ID}'
+
 
     try:
         schedule_data = get_schedule()
@@ -288,15 +358,25 @@ def main():
         EVENT_TIMEZONE = EVENT_DATA['event']['timezone']
         # Set all the global variables we'll need throughout this script
         event_name_words = [ word for word in EVENT_DATA['event']['name'].split()]
-        # Event name(shortened, all letters uppercase)
-        # Don't take the last word since that's the year
-        GDQ_EVENT_NAME = "".join([c[0].upper() for c in event_name_words[:-1]])
+        # Set event name to full event name if it's a fatales event
+        # and force-skip the fatales-specific calendar(since it's a fatales event)
+        if event_name_words[1] == "Fatales":
+            GDQ_EVENT_NAME = " ".join(event_name_words[:1])
+            INCLUDE_FATALES_ONLY_CAL = False
+        else:
+            # if a non-fatales event, use the shortened form of the name.
+            # Don't take the last word since that's the year.
+            # Also don't force-disable the
+            GDQ_EVENT_NAME = "".join([c[0].upper() for c in event_name_words[:-1]])
+
+
         # Pad the event year to 4 digits if it's only a 2-digit year
         # Such as the Speedrun Stage @ PAX events, which use 2-digit years
         if len(event_name_words[-1]) == 2:
             GDQ_EVENT_YEAR = str(2000 + int(event_name_words[-1]))
         else:
             GDQ_EVENT_YEAR = event_name_words[-1]
+
         # Set calendar names based on above
         GENERAL_CAL_NAME = f'{GDQ_EVENT_NAME} {GDQ_EVENT_YEAR} Schedule'
         FATALES_CAL_NAME = f'{GENERAL_CAL_NAME} — Fatales Runs!'
