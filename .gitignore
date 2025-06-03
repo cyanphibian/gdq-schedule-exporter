@@ -1,0 +1,6 @@
+# for privacy, ensure that the list of fatales names is never checked in.
+fatales_names.txt
+# Google API auth credentials, definitely don't check these in!
+credentials.json
+token.json
+*.ics
